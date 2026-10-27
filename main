@@ -1,0 +1,253 @@
+/*
+ * constructionzone.c
+ *
+ *
+
+ * Rules implemented:
+ *   1. Neither cars nor pedestrians wait if the zone is empty.
+ *   2. Cars cannot go in opposite directions simultaneously.
+ *   3. Pedestrians cannot cross while a car is in the zone, but
+ *      multiple pedestrians may cross at the same time.
+ *   4. Multiple cars going the same direction may be in the zone
+ *      together (they don't pass each other, they just don't block
+ *      each other on entry).
+ *   5. A car does not wait for more than two cars going the opposite
+ *      direction.
+ *   6. A pedestrian yields to cars but never waits for more than two
+ *      cars (from either direction) once it starts waiting.
+ *
+
+ *
+
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <pthread.h>
+#include <math.h>
+
+#define ZONE_LENGTH       100.0   
+#define CROSSWALK_LENGTH   10.0   
+#define MAX_ID_LEN          16
+
+
+typedef struct {
+    char   id[MAX_ID_LEN];  
+    double speed;           
+} participant_t;
+
+
+static pthread_mutex_t zone_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  cond_east = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t  cond_west = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t  cond_ped  = PTHREAD_COND_INITIALIZER;
+
+static int east_count   = 0;  
+static int west_count   = 0;  
+static int ped_count    = 0;  
+
+static int east_waiting = 0;  
+static int west_waiting = 0;  
+static int ped_waiting  = 0;  
+
+
+static int consec_east = 0;
+static int consec_west = 0;
+
+
+static int cars_since_ped_wait = 0;
+
+static int cross_seconds(double distance, double speed) {
+   
+    return (int) ceil(distance / speed);
+}
+
+
+void *carEast(void *arg) {
+    participant_t *p = (participant_t *) arg;
+
+    /* ---- entrance ---- */
+    pthread_mutex_lock(&zone_lock);
+    east_waiting++;
+    while (west_count > 0 || ped_count > 0 ||
+           (west_waiting > 0 && consec_east >= 2) ||
+           (ped_waiting  > 0 && cars_since_ped_wait >= 2)) {
+        pthread_cond_wait(&cond_east, &zone_lock);
+    }
+    east_waiting--;
+    east_count++;
+    consec_east++;
+    consec_west = 0;
+    cars_since_ped_wait++;
+
+    printf("%s entering construction\n", p->id);
+    fflush(stdout);
+    pthread_mutex_unlock(&zone_lock);
+
+    /* ---- crossing ---- */
+    sleep(cross_seconds(ZONE_LENGTH, p->speed));
+
+    /* ---- exit ---- */
+    pthread_mutex_lock(&zone_lock);
+    east_count--;
+    printf("%s exiting construction\n", p->id);
+    fflush(stdout);
+    pthread_cond_broadcast(&cond_east);
+    pthread_cond_broadcast(&cond_west);
+    pthread_cond_broadcast(&cond_ped);
+    pthread_mutex_unlock(&zone_lock);
+
+    free(p);
+    return NULL;
+}
+
+
+void *carWest(void *arg) {
+    participant_t *p = (participant_t *) arg;
+
+    /* ---- entrance ---- */
+    pthread_mutex_lock(&zone_lock);
+    west_waiting++;
+    while (east_count > 0 || ped_count > 0 ||
+           (east_waiting > 0 && consec_west >= 2) ||
+           (ped_waiting  > 0 && cars_since_ped_wait >= 2)) {
+        pthread_cond_wait(&cond_west, &zone_lock);
+    }
+    west_waiting--;
+    west_count++;
+    consec_west++;
+    consec_east = 0;
+    cars_since_ped_wait++;
+
+    printf("%s entering construction\n", p->id);
+    fflush(stdout);
+    pthread_mutex_unlock(&zone_lock);
+
+    /* ---- crossing ---- */
+    sleep(cross_seconds(ZONE_LENGTH, p->speed));
+
+
+    pthread_mutex_lock(&zone_lock);
+    west_count--;
+    printf("%s exiting construction\n", p->id);
+    fflush(stdout);
+    pthread_cond_broadcast(&cond_east);
+    pthread_cond_broadcast(&cond_west);
+    pthread_cond_broadcast(&cond_ped);
+    pthread_mutex_unlock(&zone_lock);
+
+    free(p);
+    return NULL;
+}
+
+
+void *pedestrian(void *arg) {
+    participant_t *p = (participant_t *) arg;
+
+    
+    pthread_mutex_lock(&zone_lock);
+    if (ped_waiting == 0) {
+        cars_since_ped_wait = 0;   
+    }
+    ped_waiting++;
+    while (east_count > 0 || west_count > 0) {
+        pthread_cond_wait(&cond_ped, &zone_lock);
+    }
+    ped_waiting--;
+    ped_count++;
+
+    printf("%s entering construction\n", p->id);
+    fflush(stdout);
+    pthread_mutex_unlock(&zone_lock);
+
+    /* ---- crossing ---- */
+    sleep(cross_seconds(CROSSWALK_LENGTH, p->speed));
+
+    /* ---- exit ---- */
+    pthread_mutex_lock(&zone_lock);
+    ped_count--;
+    printf("%s exiting construction\n", p->id);
+    fflush(stdout);
+    pthread_cond_broadcast(&cond_east);
+    pthread_cond_broadcast(&cond_west);
+    pthread_cond_broadcast(&cond_ped);
+    pthread_mutex_unlock(&zone_lock);
+
+    free(p);
+    return NULL;
+}
+
+
+int main(void) {
+    FILE *fp = fopen("traffic.txt", "r");
+    if (!fp) {
+        perror("fopen traffic.txt");
+        return 1;
+    }
+
+    size_t cap = 16;
+    size_t n   = 0;
+    pthread_t *threads = malloc(cap * sizeof(pthread_t));
+    if (!threads) {
+        perror("malloc");
+        fclose(fp);
+        return 1;
+    }
+
+    int    delay;
+    char   id[MAX_ID_LEN];
+    double speed;
+
+    while (fscanf(fp, "%d %15s %lf", &delay, id, &speed) == 3) {
+        if (delay > 0) {
+            sleep((unsigned int) delay);
+        }
+
+        participant_t *p = malloc(sizeof(participant_t));
+        if (!p) {
+            perror("malloc");
+            continue;
+        }
+        strncpy(p->id, id, MAX_ID_LEN - 1);
+        p->id[MAX_ID_LEN - 1] = '\0';
+        p->speed = speed;
+
+        void *(*entry_fn)(void *) = NULL;
+        switch (id[0]) {
+            case 'E': entry_fn = carEast;    break;
+            case 'W': entry_fn = carWest;    break;
+            case 'P': entry_fn = pedestrian; break;
+            default:
+                fprintf(stderr, "traffic.txt: unknown participant type '%s'\n", id);
+                free(p);
+                continue;
+        }
+
+        if (n == cap) {
+            cap *= 2;
+            pthread_t *tmp = realloc(threads, cap * sizeof(pthread_t));
+            if (!tmp) {
+                perror("realloc");
+                break;
+            }
+            threads = tmp;
+        }
+
+        if (pthread_create(&threads[n], NULL, entry_fn, p) != 0) {
+            perror("pthread_create");
+            free(p);
+            continue;
+        }
+        n++;
+    }
+    fclose(fp);
+
+    for (size_t i = 0; i < n; i++) {
+        pthread_join(threads[i], NULL);
+    }
+    free(threads);
+
+    return 0;
+}
